@@ -1,5 +1,7 @@
 #pragma once
 #include <queue>
+#include <map>
+#include <memory>
 #include "../task.hpp"
 
 namespace coro {
@@ -7,7 +9,7 @@ using coro::task;
 
 struct event_loop {
   std::queue<std::coroutine_handle<>> ready_queue;
-  std::deque<task<void>> active_tasks; // Owning
+  std::map<std::coroutine_handle<>, std::unique_ptr<task<void>>> active_tasks; // Owning
   struct yield_awaitable {
     event_loop &loop;
 
@@ -29,10 +31,12 @@ struct event_loop {
 
   yield_awaitable yield_to_event_loop() { return yield_awaitable{*this}; }
 
-  void push(task<void> task) {
-    active_tasks.emplace_back(std::move(task));
-    if (active_tasks.back().coroutine)
-      schedule(active_tasks.back().coroutine);
+  void push(task<void> t) {
+    auto ptr = std::make_unique<task<void>>(std::move(t));
+    auto const& handle = ptr->coroutine;
+    if (handle)
+      active_tasks.emplace(handle, std::move(ptr)), schedule(handle);
+    // Destroyed immediately otherwise
   }
 
   bool run_frame() {
@@ -49,8 +53,11 @@ struct event_loop {
       auto [exception, continuation] = std::coroutine_handle<
             coro::details::task_promise_t>::from_address(handle.address()).
           promise();
-      if (exception)
+      if (exception) // Halts the entire event loop if there's any outermost unhandled exception
         std::rethrow_exception(exception);
+      // Clean up
+      auto it = active_tasks.find(handle);
+      active_tasks.erase(it);
     }
     return true;
   }
@@ -60,6 +67,11 @@ struct event_loop {
       throw std::runtime_error("attempt to schedule a null handle.");
     if (handle && !handle.done())
       ready_queue.push(handle);
+  }
+
+  void reset() {
+    ready_queue = {};
+    active_tasks.clear();
   }
 };
 }
